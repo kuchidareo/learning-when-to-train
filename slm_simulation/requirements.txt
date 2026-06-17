@@ -1,0 +1,10 @@
+flwr[simulation]>=1.8
+torch
+torchvision
+numpy
+pillow
+scikit-learn
+scipy
+transformers
+accelerate
+datasets
