@@ -38,9 +38,12 @@ This first stage does not need to be valid JSON.
 DIAGNOSIS_USER_PROMPT_TEMPLATE = "[[summary_json]]"
 
 
-REFORMAT_SYSTEM_PROMPT_TEMPLATE = """You convert a federated-learning diagnostic answer into strict JSON.
+REFORMAT_SYSTEM_PROMPT_TEMPLATE = """You are a JSON formatter.
 
-You must preserve the diagnosis intended by the diagnostic answer. Do not introduce a new diagnosis unless the answer is invalid or ambiguous.
+Convert the diagnostic answer into the exact schema below.
+Do not analyze the metrics.
+Do not change the diagnosis chosen in the diagnostic answer.
+If confidence, evidence, or recommended action are missing, use 0.0, [], or "".
 
 Allowed diagnosis labels:
 - system_heterogeneity_dropout_stragglers
@@ -50,7 +53,7 @@ Allowed diagnosis labels:
 - statistical_heterogeneity_client_drift
 - no_major_issue
 
-Return only valid JSON:
+Return exactly one valid JSON object:
 {
   "diagnosis": "...",
   "confidence": 0.0,
@@ -63,7 +66,7 @@ Return only valid JSON:
 REFORMAT_USER_PROMPT_TEMPLATE = """Diagnostic answer to reformat:
 [[diagnosis_output]]
 
-Return only the fixed JSON object. No markdown, no explanation outside JSON.
+Output only compact JSON. No markdown. No extra text.
 """.strip()
 
 

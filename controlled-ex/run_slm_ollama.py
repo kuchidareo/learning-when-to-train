@@ -190,6 +190,7 @@ def call_ollama(
     keep_alive: str,
     system_prompt: str | None = None,
     user_prompt: str | None = None,
+    think: bool | None = None,
 ) -> tuple[dict[str, Any] | None, float, str]:
     effective_system_prompt = case.system_prompt if system_prompt is None else system_prompt
     effective_user_prompt = case.user_prompt if user_prompt is None else user_prompt
@@ -202,6 +203,8 @@ def call_ollama(
     }
     if effective_system_prompt:
         payload["system"] = effective_system_prompt
+    if think is not None:
+        payload["think"] = think
     if num_predict is not None:
         payload["options"]["num_predict"] = num_predict
 
@@ -359,6 +362,15 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum generated tokens. Omit to use the Ollama/model default.",
     )
     parser.add_argument("--keep_alive", default="10m")
+    parser.add_argument(
+        "--reformat_think",
+        choices=["default", "true", "false"],
+        default="default",
+        help=(
+            "Ollama thinking mode for modular JSON reformat stage only. "
+            "Use false to send think=false, true to send think=true, default to omit."
+        ),
+    )
     parser.add_argument("--raw_response_max_chars", type=int, default=20000)
     parser.add_argument("--raw_ollama_max_chars", type=int, default=40000)
     parser.add_argument("--append", action="store_true")
@@ -369,6 +381,11 @@ def main() -> None:
     args = parse_args()
     if args.num_predict is not None and args.num_predict < 0:
         args.num_predict = None
+    reformat_think = None
+    if args.reformat_think == "true":
+        reformat_think = True
+    elif args.reformat_think == "false":
+        reformat_think = False
 
     cases = load_slm_jsonl_prompt_cases(args.jsonl_file, args.runs)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -410,6 +427,7 @@ def main() -> None:
                 keep_alive=args.keep_alive,
                 system_prompt=case.reformat_system_prompt,
                 user_prompt=reformat_user_prompt,
+                think=reformat_think,
             )
             wall_time_sec = diagnosis_wall_time_sec + reformat_wall_time_sec
             response_json = reformat_response_json
