@@ -118,6 +118,26 @@ def remove_misleading_diagnostic_hints(user_payload: dict[str, Any]) -> dict[str
     return cleaned
 
 
+def remove_label_prior_shift_signal(user_payload: dict[str, Any]) -> dict[str, Any]:
+    """Remove label-prior shift signal that confounds the intended taxonomy."""
+    cleaned = copy.deepcopy(user_payload)
+    summary = cleaned.get("summary")
+    if not isinstance(summary, dict):
+        return cleaned
+    shift_and_memory = summary.get("shift_and_memory")
+    if isinstance(shift_and_memory, dict):
+        shift_and_memory.pop("js_current_baseline_label", None)
+    hints = summary.get("diagnostic_hints")
+    if isinstance(hints, dict):
+        comparisons = hints.get("comparisons")
+        if isinstance(comparisons, dict):
+            comparisons.pop("shift_and_memory.js_current_baseline_label", None)
+        reference_stats = hints.get("reference_stats")
+        if isinstance(reference_stats, dict):
+            reference_stats.pop("shift_and_memory.js_current_baseline_label", None)
+    return cleaned
+
+
 def make_tokens(record: dict[str, Any], *, keep_z_scores: bool = False) -> dict[str, str]:
     messages = record.get("messages")
     messages = messages if isinstance(messages, list) else []
@@ -128,7 +148,9 @@ def make_tokens(record: dict[str, Any], *, keep_z_scores: bool = False) -> dict[
     if len(messages) >= 2 and isinstance(messages[1], dict):
         user_prompt = str(messages[1].get("content", ""))
 
-    user_payload = remove_misleading_diagnostic_hints(parse_user_payload(record))
+    user_payload = remove_label_prior_shift_signal(
+        remove_misleading_diagnostic_hints(parse_user_payload(record))
+    )
     user_payload_without_z_scores = remove_comparison_z_scores(user_payload)
     prompt_payload = user_payload if keep_z_scores else user_payload_without_z_scores
     return {
