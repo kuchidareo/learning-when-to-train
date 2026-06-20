@@ -28,12 +28,66 @@ class PromptCase:
     trial_index: str = ""
     source_model: str = ""
     summary_json: str = ""
+    top_level_summary_json: str = ""
+    reference_scenario: str = ""
+    reference_interpretation: str = ""
+    above_reference_p95_metrics: str = ""
+    above_reference_p95_count: int = 0
+    comparison_metrics_json: str = ""
+    reference_stats_json: str = ""
+    decision_notes_json: str = ""
+    reformat_system_prompt: str = ""
+    reformat_user_prompt: str = ""
 
     @property
     def full_prompt(self) -> str:
         if self.system_prompt:
             return f"{self.system_prompt}\n\n{self.user_prompt}"
         return self.user_prompt
+
+    @property
+    def is_modular(self) -> bool:
+        return bool(self.reformat_user_prompt)
+
+    def render_reformat_user_prompt(self, diagnosis_output: str) -> str:
+        return self.reformat_user_prompt.replace("[[diagnosis_output]]", diagnosis_output)
+
+
+def parse_user_prompt_summary(user_prompt: str, fallback_summary: Any) -> dict[str, Any]:
+    try:
+        payload = json.loads(user_prompt)
+    except json.JSONDecodeError:
+        payload = {}
+    if isinstance(payload, dict) and isinstance(payload.get("summary"), dict):
+        return payload["summary"]
+    return fallback_summary if isinstance(fallback_summary, dict) else {}
+
+
+def extract_reference_fields(summary: dict[str, Any]) -> dict[str, Any]:
+    hints = summary.get("diagnostic_hints")
+    hints = hints if isinstance(hints, dict) else {}
+    comparisons = hints.get("comparisons")
+    comparisons = comparisons if isinstance(comparisons, dict) else {}
+    reference_stats = hints.get("reference_stats")
+    reference_stats = reference_stats if isinstance(reference_stats, dict) else {}
+    decision_notes = hints.get("decision_notes")
+    decision_notes = decision_notes if isinstance(decision_notes, list) else []
+
+    above_p95 = sorted(
+        metric
+        for metric, comparison in comparisons.items()
+        if isinstance(comparison, dict) and comparison.get("above_reference_p95") is True
+    )
+
+    return {
+        "reference_scenario": str(hints.get("reference_scenario", "")),
+        "reference_interpretation": str(hints.get("reference_interpretation", "")),
+        "above_reference_p95_metrics": "|".join(above_p95),
+        "above_reference_p95_count": len(above_p95),
+        "comparison_metrics_json": json.dumps(comparisons, ensure_ascii=False),
+        "reference_stats_json": json.dumps(reference_stats, ensure_ascii=False),
+        "decision_notes_json": json.dumps(decision_notes, ensure_ascii=False),
+    }
 
 
 def duration_ns_to_sec(value: Any) -> float:
@@ -63,10 +117,24 @@ def load_slm_jsonl_prompt_cases(jsonl_file: Path, runs: int) -> list[PromptCase]
                     f"{jsonl_file}:{source_line} expected messages[0].role=system "
                     "and messages[1].role=user"
                 )
+            reformat_system_prompt = ""
+            reformat_user_prompt = ""
+            reformat_messages = record.get("reformat_messages")
+            if isinstance(reformat_messages, list) and len(reformat_messages) >= 2:
+                if reformat_messages[0].get("role") != "system" or reformat_messages[1].get("role") != "user":
+                    raise ValueError(
+                        f"{jsonl_file}:{source_line} expected reformat_messages[0].role=system "
+                        "and reformat_messages[1].role=user"
+                    )
+                reformat_system_prompt = str(reformat_messages[0].get("content", ""))
+                reformat_user_prompt = str(reformat_messages[1].get("content", ""))
 
             scenario_id = str(record.get("scenario_id", ""))
             trial_index = str(record.get("trial_index", ""))
             prompt_name = f"{scenario_id}_trial_{trial_index}" if scenario_id else f"jsonl_line_{source_line}"
+            top_level_summary = record.get("summary", {})
+            prompt_summary = parse_user_prompt_summary(str(user_message.get("content", "")), top_level_summary)
+            reference_fields = extract_reference_fields(prompt_summary)
             for repeat_index in range(1, runs + 1):
                 cases.append(
                     PromptCase(
@@ -82,7 +150,11 @@ def load_slm_jsonl_prompt_cases(jsonl_file: Path, runs: int) -> list[PromptCase]
                         trial_id=str(record.get("trial_id", "")),
                         trial_index=trial_index,
                         source_model=str(record.get("model", "")),
-                        summary_json=json.dumps(record.get("summary", {}), ensure_ascii=False),
+                        summary_json=json.dumps(prompt_summary, ensure_ascii=False),
+                        top_level_summary_json=json.dumps(top_level_summary, ensure_ascii=False),
+                        reformat_system_prompt=reformat_system_prompt,
+                        reformat_user_prompt=reformat_user_prompt,
+                        **reference_fields,
                     )
                 )
 
@@ -116,16 +188,20 @@ def call_ollama(
     temperature: float,
     num_predict: int | None,
     keep_alive: str,
+    system_prompt: str | None = None,
+    user_prompt: str | None = None,
 ) -> tuple[dict[str, Any] | None, float, str]:
+    effective_system_prompt = case.system_prompt if system_prompt is None else system_prompt
+    effective_user_prompt = case.user_prompt if user_prompt is None else user_prompt
     payload: dict[str, Any] = {
         "model": model,
-        "prompt": case.user_prompt,
+        "prompt": effective_user_prompt,
         "stream": False,
         "keep_alive": keep_alive,
         "options": {"temperature": temperature},
     }
-    if case.system_prompt:
-        payload["system"] = case.system_prompt
+    if effective_system_prompt:
+        payload["system"] = effective_system_prompt
     if num_predict is not None:
         payload["options"]["num_predict"] = num_predict
 
@@ -159,9 +235,19 @@ def make_row(
     error: str,
     raw_response_max_chars: int,
     raw_ollama_max_chars: int,
+    diagnosis_response_json: dict[str, Any] | None = None,
+    diagnosis_wall_time_sec: float = 0.0,
+    diagnosis_error: str = "",
+    reformat_response_json: dict[str, Any] | None = None,
+    reformat_wall_time_sec: float = 0.0,
+    reformat_error: str = "",
 ) -> dict[str, Any]:
     response_json = response_json or {}
+    diagnosis_response_json = diagnosis_response_json or {}
+    reformat_response_json = reformat_response_json or {}
     raw_response = str(response_json.get("response") or "")
+    raw_diagnosis_response = str(diagnosis_response_json.get("response") or "")
+    raw_reformat_response = str(reformat_response_json.get("response") or "")
     parsed_response = parse_response_object(raw_response)
     response_diagnosis = str(parsed_response.get("diagnosis", ""))
     response_confidence = parsed_response.get("confidence", "")
@@ -173,6 +259,10 @@ def make_row(
     completion_tokens = int(response_json.get("eval_count") or 0)
     eval_duration_sec = duration_ns_to_sec(response_json.get("eval_duration"))
     tokens_per_sec = completion_tokens / eval_duration_sec if eval_duration_sec > 0 else 0.0
+    diagnosis_prompt_tokens = int(diagnosis_response_json.get("prompt_eval_count") or 0)
+    diagnosis_completion_tokens = int(diagnosis_response_json.get("eval_count") or 0)
+    reformat_prompt_tokens = int(reformat_response_json.get("prompt_eval_count") or 0)
+    reformat_completion_tokens = int(reformat_response_json.get("eval_count") or 0)
 
     return {
         "run_started_at": run_started_at,
@@ -186,11 +276,20 @@ def make_row(
         "trial_id": case.trial_id,
         "trial_index": case.trial_index,
         "source_model": case.source_model,
+        "reference_scenario": case.reference_scenario,
+        "reference_interpretation": case.reference_interpretation,
+        "above_reference_p95_metrics": case.above_reference_p95_metrics,
+        "above_reference_p95_count": case.above_reference_p95_count,
         "ollama_model": model,
         "host": host,
+        "prompt_pipeline": "modular" if case.is_modular else "single",
         "success": error == "",
         "error": error,
         "wall_time_sec": wall_time_sec,
+        "diagnosis_error": diagnosis_error,
+        "reformat_error": reformat_error,
+        "diagnosis_wall_time_sec": diagnosis_wall_time_sec,
+        "reformat_wall_time_sec": reformat_wall_time_sec,
         "ollama_total_duration_sec": duration_ns_to_sec(response_json.get("total_duration")),
         "load_duration_sec": duration_ns_to_sec(response_json.get("load_duration")),
         "prompt_eval_duration_sec": duration_ns_to_sec(response_json.get("prompt_eval_duration")),
@@ -198,9 +297,17 @@ def make_row(
         "prompt_tokens": prompt_tokens,
         "completion_tokens": completion_tokens,
         "total_tokens": prompt_tokens + completion_tokens,
+        "diagnosis_prompt_tokens": diagnosis_prompt_tokens,
+        "diagnosis_completion_tokens": diagnosis_completion_tokens,
+        "diagnosis_total_tokens": diagnosis_prompt_tokens + diagnosis_completion_tokens,
+        "reformat_prompt_tokens": reformat_prompt_tokens,
+        "reformat_completion_tokens": reformat_completion_tokens,
+        "reformat_total_tokens": reformat_prompt_tokens + reformat_completion_tokens,
         "tokens_per_sec_eval": tokens_per_sec,
         "system_prompt_chars": len(case.system_prompt),
         "user_prompt_chars": len(case.user_prompt),
+        "reformat_system_prompt_chars": len(case.reformat_system_prompt),
+        "reformat_user_prompt_chars": len(case.reformat_user_prompt),
         "prompt_chars": len(case.full_prompt),
         "response_chars": len(raw_response),
         "done_reason": response_json.get("done_reason", ""),
@@ -208,6 +315,12 @@ def make_row(
         "response_confidence": response_confidence,
         "is_correct": is_correct,
         "summary_json": case.summary_json,
+        "top_level_summary_json": case.top_level_summary_json,
+        "comparison_metrics_json": case.comparison_metrics_json,
+        "reference_stats_json": case.reference_stats_json,
+        "decision_notes_json": case.decision_notes_json,
+        "raw_diagnosis_response": raw_diagnosis_response[:raw_response_max_chars],
+        "raw_reformat_response": raw_reformat_response[:raw_response_max_chars],
         "raw_response": raw_response[:raw_response_max_chars],
         "raw_ollama_json": json.dumps(response_json, ensure_ascii=False)[:raw_ollama_max_chars],
     }
@@ -268,7 +381,7 @@ def main() -> None:
     print(f"Using model={args.model} host={args.host}")
 
     for completed, case in enumerate(cases, start=1):
-        response_json, wall_time_sec, error = call_ollama(
+        diagnosis_response_json, diagnosis_wall_time_sec, diagnosis_error = call_ollama(
             case=case,
             model=args.model,
             host=args.host,
@@ -277,6 +390,31 @@ def main() -> None:
             num_predict=args.num_predict,
             keep_alive=args.keep_alive,
         )
+        response_json = diagnosis_response_json
+        wall_time_sec = diagnosis_wall_time_sec
+        error = diagnosis_error
+        reformat_response_json = None
+        reformat_wall_time_sec = 0.0
+        reformat_error = ""
+
+        if case.is_modular and not diagnosis_error:
+            diagnosis_output = str((diagnosis_response_json or {}).get("response") or "")
+            reformat_user_prompt = case.render_reformat_user_prompt(diagnosis_output)
+            reformat_response_json, reformat_wall_time_sec, reformat_error = call_ollama(
+                case=case,
+                model=args.model,
+                host=args.host,
+                timeout=args.timeout,
+                temperature=args.temperature,
+                num_predict=args.num_predict,
+                keep_alive=args.keep_alive,
+                system_prompt=case.reformat_system_prompt,
+                user_prompt=reformat_user_prompt,
+            )
+            wall_time_sec = diagnosis_wall_time_sec + reformat_wall_time_sec
+            response_json = reformat_response_json
+            error = reformat_error
+
         row = make_row(
             run_started_at=run_started_at,
             case=case,
@@ -287,16 +425,22 @@ def main() -> None:
             error=error,
             raw_response_max_chars=args.raw_response_max_chars,
             raw_ollama_max_chars=args.raw_ollama_max_chars,
+            diagnosis_response_json=diagnosis_response_json,
+            diagnosis_wall_time_sec=diagnosis_wall_time_sec,
+            diagnosis_error=diagnosis_error,
+            reformat_response_json=reformat_response_json,
+            reformat_wall_time_sec=reformat_wall_time_sec,
+            reformat_error=reformat_error,
         )
         write_rows_incrementally(output_csv, [row], append=args.append or not first_write)
         first_write = False
 
         status = "ok" if not error else "error"
         diagnosis = f" diagnosis={row['response_diagnosis']}" if row["response_diagnosis"] else ""
-        message = (
-            f"[{completed}/{total}] {case.prompt_name} run={case.repeat_index} "
-            f"{status} wall={wall_time_sec:.3f}s{diagnosis}"
-        )
+        pipeline = " modular" if case.is_modular else ""
+        message = f"[{completed}/{total}] {case.prompt_name} run={case.repeat_index}{pipeline} {status} wall={wall_time_sec:.3f}s{diagnosis}"
+        if case.is_modular:
+            message += f" diagnosis_wall={diagnosis_wall_time_sec:.3f}s reformat_wall={reformat_wall_time_sec:.3f}s"
         if error:
             message += f" error={error}"
         print(message)
